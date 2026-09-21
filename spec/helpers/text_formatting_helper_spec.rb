@@ -111,7 +111,7 @@ RSpec.describe TextFormattingHelper do
         "Lorem ipsum dolor sit <br/> amet, consetetur sadipscing elitr, sed diam nonumy eirmod <br /> tempor invidunt"
       end
 
-      it "replaces escaped line breaks with html line breaks and should be html_safe" do
+      it "replaces line breaks with html line breaks" do
         expect(truncate_formatted_text(text))
           .to be_html_eql(text_html)
       end
@@ -125,11 +125,6 @@ RSpec.describe TextFormattingHelper do
         it "returns the text unaltered" do
           expect(truncate_formatted_text(text, replace_newlines: false))
             .to be_html_eql(text)
-        end
-
-        it "is html_safe" do
-          expect(truncate_formatted_text(text, replace_newlines: false))
-            .to be_html_safe
         end
       end
     end

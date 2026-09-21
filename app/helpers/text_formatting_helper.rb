@@ -30,6 +30,8 @@
 
 module TextFormattingHelper
   include OpenProject::TextFormatting
+  include ActionView::Helpers::TagHelper
+  include ActionView::Helpers::OutputSafetyHelper
   extend Forwardable
 
   def_delegators :current_formatting_helper,
@@ -81,22 +83,11 @@ module TextFormattingHelper
 
   def truncate_formatted_text(text, length: 120, replace_newlines: true)
     stripped_text = strip_tags(format_text(text.to_s))
+    stripped_text = (length ? truncate_multiline(stripped_text, length) : stripped_text).strip
 
-    stripped_text = if length
-                      truncate_multiline(stripped_text, length)
-                    else
-                      stripped_text
-                    end
-                      .strip
+    return stripped_text unless replace_newlines
 
-    if replace_newlines
-      stripped_text.gsub!(/[\r\n]+/, "<br/>")
-    else
-      stripped_text
-    end
-
-    # Sanitized through strip_tags
-    stripped_text.html_safe # rubocop:disable Rails/OutputSafety
+    safe_join(stripped_text.split(/[\r\n]+/), tag.br)
   end
 
   def truncate_multiline(string, length)
