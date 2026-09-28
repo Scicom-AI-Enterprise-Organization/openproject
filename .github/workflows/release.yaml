@@ -1,28 +1,29 @@
 name: Release
 
-# Builds the OpenProject "slim" production image from docker/prod/Dockerfile and pushes
-# it to the scicom/openproject-dev ECR repo (used by the openproject-dev second instance
-# in AIES-Infra/aies-argocd). Single-arch amd64 — the AIES httpd node pool (all 28 nodes)
-# is amd64, so the template's arm64 matrix entry + manifest-merge job are dropped.
+# Builds the OpenProject "slim" production image (docker/prod/Dockerfile) and pushes it to
+# ECR scicom/openproject-dev, for the openproject-dev second instance in AIES-Infra/aies-argocd.
 #
-# IMPORTANT build args (differ from the standard deploy-to-eks template):
-#   file:   ./docker/prod/Dockerfile   (no Dockerfile in repo root)
-#   target: slim                        (all-in-one target does NOT boot under the Helm chart)
+# Design notes (differs from the standard deploy-to-eks template, on purpose):
+#   - runs-on: ubuntu-latest  — this fork lives in Scicom-AI-Enterprise-Organization, which has
+#     no `ubuntu-24.04-x64-big` large runner (the template's label just queues forever here).
+#   - version is an explicit input, NOT a git-tag semver bump — the fork carries 300+ upstream
+#     OpenProject `v*` tags (highest v17.8.1), so "bump from latest tag" would build v17.8.x.
+#     The aies-argocd app pins the image tag directly (no ArgoCD Image Updater), so an explicit
+#     version is both correct and simpler. No git tag / GitHub release is created.
+#   - single-arch linux/amd64 — the AIES httpd node pool is amd64 (all 28 nodes).
+#   - file: ./docker/prod/Dockerfile, target: slim — no root Dockerfile; the all-in-one target
+#     does NOT boot under the Helm chart.
 
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: Version bump type
+      version:
+        description: "Image version to build and push (e.g. 0.0.1)"
         required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        default: "0.0.1"
 
 permissions:
-  contents: write
+  contents: read
   id-token: write        # required to assume AWS_ROLE_ARN over GitHub OIDC
 
 env:
@@ -32,63 +33,28 @@ env:
   AWS_ROLE_ARN: arn:aws:iam::865626945255:role/Scicom-OpenprojectDev-ECRAccessRole
 
 jobs:
-  version:
-    name: Compute Version
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.bump.outputs.version }}
-      tag: ${{ steps.bump.outputs.tag }}
-      prev_tag: ${{ steps.bump.outputs.prev_tag }}
-      major_minor: ${{ steps.bump.outputs.major_minor }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - id: bump
-        run: |
-          BUMP="${{ inputs.bump }}"
-          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -1)
-          if [ -z "$LATEST_TAG" ]; then
-            CURRENT="0.0.0"
-          else
-            CURRENT=$(echo "$LATEST_TAG" | sed "s/v//")
-          fi
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "$BUMP" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          NEXT="${MAJOR}.${MINOR}.${PATCH}"
-          TAG="v${NEXT}"
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "prev_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "major_minor=${MAJOR}.${MINOR}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push tag
-        run: |
-          git tag "${{ steps.bump.outputs.tag }}"
-          git push origin "${{ steps.bump.outputs.tag }}"
-
   build:
-    name: Build (linux/amd64)
-    needs: version
-    runs-on: ubuntu-24.04-x64-big
+    name: Build & push (linux/amd64)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Ensure Docker access
+      - name: Free up disk space
         run: |
-          if ! command -v docker &> /dev/null; then
-            curl -fsSL https://get.docker.com | sh
-          fi
-          sudo systemctl start docker || true
-          sudo usermod -aG docker "$USER"
-          sudo chmod 666 /var/run/docker.sock
+          # OpenProject's slim image is large (Ruby gems + Angular build); the default
+          # runner root fs is tight, so drop preinstalled toolchains we don't need.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -af || true
+          df -h /
+
+      - id: ver
+        run: |
+          V="${{ inputs.version }}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${V%.*}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -108,30 +74,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.version.outputs.version }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.version.outputs.major_minor }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.ver.outputs.version }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.ver.outputs.major_minor }}
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           cache-from: type=gha,scope=build-linux-amd64
           cache-to: type=gha,mode=max,scope=build-linux-amd64
-
-  release:
-    name: Create Release
-    needs: [version, build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ needs.version.outputs.tag }}"
-          VERSION="${{ needs.version.outputs.version }}"
-          PREV_TAG="${{ needs.version.outputs.prev_tag }}"
-          RELEASE_ARGS=("$TAG" --title "v${VERSION}" --generate-notes --latest=false)
-          if [ -n "$PREV_TAG" ]; then
-            RELEASE_ARGS+=(--notes-start-tag "$PREV_TAG")
-          fi
-          gh release create "${RELEASE_ARGS[@]}"
